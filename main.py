@@ -1,6 +1,7 @@
-from flask import Flask, jsonify
-import requests, time, math
+from flask import Flask, jsonify, Response
+import requests, time
 import numpy as np
+import json
 
 app = Flask(__name__)
 
@@ -19,7 +20,6 @@ NSE_ALL_INDICES = "https://www.nseindia.com/api/allIndices"
 NSE_OPTION_CHAIN = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
 YAHOO_INTRADAY = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?range=1d&interval=5m"
 
-# Last known fallbacks so API glitches don't break responses
 CACHE = {
     "pcr": None,
     "vix": None,
@@ -29,24 +29,18 @@ CACHE = {
     "support": None,
     "resistance": None,
     "max_pain": None,
+    "closes": None,
     "ts": 0
 }
 
-# ----------------------------
-# Utility: warm-up cookies
-# ----------------------------
 def warmup():
     try:
         SESSION.get(NSE_HOME, headers=HEADERS, timeout=6)
     except Exception as e:
         print("Warmup warn:", e)
 
-# ----------------------------
-# Safe JSON GET with warm-up + fallback
-# ----------------------------
 def json_get(url, timeout=8):
     try:
-        # warm-up cookie if needed (simple throttle)
         if time.time() - CACHE["ts"] > 30:
             warmup()
             CACHE["ts"] = time.time()
@@ -63,9 +57,6 @@ def json_get(url, timeout=8):
         print("⚠ json_get error:", e)
         return None
 
-# ----------------------------
-# Fetch Nifty & VIX from allIndices
-# ----------------------------
 def fetch_nifty_and_vix():
     data = json_get(NSE_ALL_INDICES)
     last = CACHE["nifty_last"]
@@ -91,9 +82,6 @@ def fetch_nifty_and_vix():
     CACHE["vix"] = vix
     return last, prev_close, vix
 
-# ----------------------------
-# Option chain → PCR, OI levels, max pain
-# ----------------------------
 def fetch_option_chain():
     data = json_get(NSE_OPTION_CHAIN)
     if not data or "records" not in data:
@@ -116,35 +104,25 @@ def compute_pcr(oc):
     return None
 
 def compute_oi_levels(oc, spot):
-    """Return (support, resistance) using nearest strong PE/CE OI strikes around spot."""
     support = CACHE["support"]
     resistance = CACHE["resistance"]
     try:
-        pe_levels = []
-        ce_levels = []
+        pe_levels, ce_levels = [], []
         for row in oc["records"]["data"]:
             strike = row.get("strikePrice")
-            if strike is None:
-                continue
+            if strike is None: continue
             if "PE" in row and row["PE"].get("openInterest") is not None:
                 pe_levels.append((strike, int(row["PE"]["openInterest"])))
             if "CE" in row and row["CE"].get("openInterest") is not None:
                 ce_levels.append((strike, int(row["CE"]["openInterest"])))
-
-        # strongest below/above spot
         pe_below = [x for x in pe_levels if x[0] <= (spot or 0)]
         ce_above = [x for x in ce_levels if x[0] >= (spot or 0)]
-
-        pe_below.sort(key=lambda x: (abs((spot or 0) - x[0]), -x[1]))  # nearest with high OI
+        pe_below.sort(key=lambda x: (abs((spot or 0) - x[0]), -x[1]))
         ce_above.sort(key=lambda x: (abs(x[0] - (spot or 0)), -x[1]))
-
-        if pe_below:
-            support = pe_below[0][0]
-        if ce_above:
-            resistance = ce_above[0][0]
+        if pe_below: support = pe_below[0][0]
+        if ce_above: resistance = ce_above[0][0]
     except Exception as e:
         print("⚠ compute_oi_levels:", e)
-
     CACHE["support"] = support
     CACHE["resistance"] = resistance
     return support, resistance
@@ -154,14 +132,12 @@ def compute_max_pain(oc):
         oi_by_strike = {}
         for row in oc["records"]["data"]:
             strike = row.get("strikePrice")
-            if strike is None:
-                continue
+            if strike is None: continue
             ce = int(row["CE"]["openInterest"]) if "CE" in row and row["CE"].get("openInterest") else 0
             pe = int(row["PE"]["openInterest"]) if "PE" in row and row["PE"].get("openInterest") else 0
             oi_by_strike[strike] = oi_by_strike.get(strike, 0) + ce + pe
         if not oi_by_strike:
             return CACHE["max_pain"]
-        # strike with max total OI
         max_strike = max(oi_by_strike, key=lambda k: oi_by_strike[k])
         CACHE["max_pain"] = max_strike
         return max_strike
@@ -169,22 +145,20 @@ def compute_max_pain(oc):
         print("⚠ compute_max_pain:", e)
         return CACHE["max_pain"]
 
-# ----------------------------
-# Yahoo intraday → RSI(14)
-# ----------------------------
 def fetch_yahoo_intraday_closes():
     data = json_get(YAHOO_INTRADAY, timeout=8)
     if not data or "chart" not in data or not data["chart"].get("result"):
-        return None
+        return CACHE["closes"]
     try:
         result = data["chart"]["result"][0]
         closes = result["indicators"]["quote"][0]["close"]
-        # filter None
         closes = [c for c in closes if c is not None]
-        return closes if len(closes) >= 15 else None
+        if closes and len(closes) >= 15:
+            CACHE["closes"] = closes
+        return CACHE["closes"]
     except Exception as e:
         print("⚠ parse yahoo:", e)
-        return None
+        return CACHE["closes"]
 
 def rsi(series, period=14):
     if not series or len(series) <= period:
@@ -211,74 +185,38 @@ def fetch_rsi():
         print("⚠ fetch_rsi:", e)
         return CACHE["rsi"]
 
-# ----------------------------
-# Signal logic
-# ----------------------------
 def build_signal(spot, pcr, vix, rsi_val, support, resistance, max_pain):
-    # Heuristics with confidence scoring
     score = 0
     reasons = []
-
     if spot and support and resistance:
-        if support < spot < resistance:
-            reasons.append("Within OI S/R range (neutral).")
-        if spot > resistance:
-            score += 2; reasons.append("Spot above OI resistance (bullish breakout).")
-        if spot < support:
-            score -= 2; reasons.append("Spot below OI support (bearish breakdown).")
-        # distance to max pain
+        if spot > resistance: score += 2; reasons.append("Above OI resistance (breakout).")
+        elif spot < support: score -= 2; reasons.append("Below OI support (breakdown).")
+        else: reasons.append("Inside OI S/R range (neutral).")
         if max_pain:
             dist_mp = spot - max_pain
-            if abs(dist_mp) < 50:
-                reasons.append("Near max pain (mean-revert risk).")
-            elif dist_mp > 0:
-                score += 1; reasons.append("Spot above max pain (bullish bias).")
-            else:
-                score -= 1; reasons.append("Spot below max pain (bearish bias).")
-
+            if abs(dist_mp) < 50: reasons.append("Near max pain (mean-revert risk).")
+            elif dist_mp > 0: score += 1; reasons.append("Above max pain (bullish bias).")
+            else: score -= 1; reasons.append("Below max pain (bearish bias).")
     if pcr is not None:
-        if pcr > 1.3:
-            score += 1; reasons.append(f"High PCR {pcr} (bullish).")
-        elif pcr < 0.7:
-            score -= 1; reasons.append(f"Low PCR {pcr} (bearish).")
-        else:
-            reasons.append(f"Neutral PCR {pcr}.")
-
+        if pcr > 1.3: score += 1; reasons.append(f"PCR {pcr} high (bullish).")
+        elif pcr < 0.7: score -= 1; reasons.append(f"PCR {pcr} low (bearish).")
+        else: reasons.append(f"PCR {pcr} neutral.")
     if rsi_val is not None:
-        if 45 <= rsi_val <= 55:
-            reasons.append(f"RSI {rsi_val} neutral.")
-        elif rsi_val < 35:
-            score -= 1; reasons.append(f"RSI {rsi_val} oversold → bearish momentum risk.")
-        elif rsi_val > 65:
-            score += 1; reasons.append(f"RSI {rsi_val} strong → bullish momentum.")
-
-    if vix is not None:
-        if vix >= 16:
-            reasons.append(f"High VIX {vix} (volatility risk).")
-            # dampen confidence
-            score = score * 0.8
-
-    # Final label
+        if rsi_val > 65: score += 1; reasons.append(f"RSI {rsi_val} strong.")
+        elif rsi_val < 35: score -= 1; reasons.append(f"RSI {rsi_val} weak.")
+        else: reasons.append(f"RSI {rsi_val} neutral.")
+    if vix is not None and vix >= 16:
+        reasons.append(f"High VIX {vix} (volatility risk).")
+        score = score * 0.8  # dampen confidence
     label = "Neutral"
-    if score >= 1.5:
-        label = "Bullish"
-    elif score <= -1.5:
-        label = "Bearish"
-
-    # Confidence (0-100) from |score|
+    if score >= 1.5: label = "Bullish"
+    elif score <= -1.5: label = "Bearish"
     conf = int(max(0, min(100, 50 + (score * 15))))
     return label, conf, reasons
 
 # ----------------------------
-# Routes
+# API Routes
 # ----------------------------
-@app.route("/")
-def root():
-    return jsonify({
-        "status": "OK",
-        "routes": ["/signal", "/pcr", "/levels", "/vix", "/health"]
-    })
-
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
@@ -286,11 +224,8 @@ def health():
 @app.route("/pcr")
 def pcr_route():
     oc = fetch_option_chain()
-    pcr = compute_pcr(oc) if oc else None
-    if pcr is None:
-        pcr = CACHE["pcr"]
-    else:
-        CACHE["pcr"] = pcr
+    pcr = compute_pcr(oc) if oc else CACHE["pcr"]
+    if pcr is not None: CACHE["pcr"] = pcr
     return jsonify({"pcr": pcr, "note": "Fallback to last known value if live unavailable."})
 
 @app.route("/vix")
@@ -302,30 +237,6 @@ def vix_route():
 def levels_route():
     spot, _, _ = fetch_nifty_and_vix()
     oc = fetch_option_chain()
-    support, resistance = (None, None)
-    max_pain = None
-    if oc:
-        support, resistance = compute_oi_levels(oc, spot)
-        max_pain = compute_max_pain(oc)
-    # update cache if new
-    if support is not None: CACHE["support"] = support
-    if resistance is not None: CACHE["resistance"] = resistance
-    if max_pain is not None: CACHE["max_pain"] = max_pain
-    return jsonify({
-        "spot": spot,
-        "support": support,
-        "resistance": resistance,
-        "max_pain": max_pain
-    })
-
-@app.route("/signal")
-def signal_route():
-    spot, prev_close, vix = fetch_nifty_and_vix()
-    oc = fetch_option_chain()
-    pcr = compute_pcr(oc) if oc else CACHE["pcr"]
-    if pcr is not None:
-        CACHE["pcr"] = pcr
-
     support, resistance = CACHE["support"], CACHE["resistance"]
     max_pain = CACHE["max_pain"]
     if oc:
@@ -334,29 +245,174 @@ def signal_route():
         support = s2 or support
         resistance = r2 or resistance
         max_pain = mp2 or max_pain
+    if support is not None: CACHE["support"] = support
+    if resistance is not None: CACHE["resistance"] = resistance
+    if max_pain is not None: CACHE["max_pain"] = max_pain
+    return jsonify({"spot": spot, "support": support, "resistance": resistance, "max_pain": max_pain})
 
+@app.route("/chart")
+def chart_route():
+    closes = fetch_yahoo_intraday_closes()
+    return jsonify({"closes": closes[-60:] if closes else None})
+
+@app.route("/signal")
+def signal_route():
+    spot, prev_close, vix = fetch_nifty_and_vix()
+    oc = fetch_option_chain()
+    pcr = compute_pcr(oc) if oc else CACHE["pcr"]
+    if pcr is not None: CACHE["pcr"] = pcr
+    support, resistance = CACHE["support"], CACHE["resistance"]
+    max_pain = CACHE["max_pain"]
+    if oc:
+        s2, r2 = compute_oi_levels(oc, spot)
+        mp2 = compute_max_pain(oc)
+        support = s2 or support
+        resistance = r2 or resistance
+        max_pain = mp2 or max_pain
     rsi_val = fetch_rsi()
-
     label, conf, reasons = build_signal(spot, pcr, vix, rsi_val, support, resistance, max_pain)
     return jsonify({
-        "spot": spot,
-        "prev_close": prev_close,
-        "vix": vix,
-        "pcr": pcr,
-        "rsi14": rsi_val,
-        "support": support,
-        "resistance": resistance,
-        "max_pain": max_pain,
-        "signal": label,
-        "confidence": conf,
-        "reasons": reasons,
-        "note": "All endpoints are resilient to NSE/Yahoo hiccups; values may be cached if live feed blocks."
+        "spot": spot, "prev_close": prev_close, "vix": vix, "pcr": pcr, "rsi14": rsi_val,
+        "support": support, "resistance": resistance, "max_pain": max_pain,
+        "signal": label, "confidence": conf, "reasons": reasons
     })
+
+# ----------------------------
+# Web Dashboard (root "/")
+# ----------------------------
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nifty Intraday Dashboard</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  :root { color-scheme: dark light; }
+  body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0f1220; color:#e6e8f0; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 14px; }
+  .grid { display: grid; gap: 12px; grid-template-columns: 1fr; }
+  @media (min-width: 900px) { .grid { grid-template-columns: 2fr 1fr; } }
+  .card { background:#151837; border:1px solid #262a57; border-radius:16px; padding:14px; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
+  .title { font-size: 18px; margin: 0 0 8px; opacity:.9 }
+  .big { font-size: 28px; margin: 6px 0; font-weight: 700; }
+  .row { display:flex; gap: 10px; flex-wrap: wrap; }
+  .pill { padding:6px 10px; border-radius:999px; background:#1e2352; border:1px solid #2d3470; font-size: 13px; }
+  .good { background:#103f2d; border-color:#1c6b4c; }
+  .bad { background:#4a1a22; border-color:#7b2a36; }
+  .neutral { background:#2e2e2e; border-color:#454545; }
+  .signal { font-size: 20px; font-weight: 800; }
+  .reason { font-size: 13px; opacity:.9; margin: 2px 0; }
+  canvas { width:100%; height:260px; }
+  a { color:#8ab4ff; text-decoration: none; }
+  footer { opacity:.6; font-size:12px; text-align:center; margin-top: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="grid">
+    <div class="card">
+      <div class="title">Nifty Intraday — Live</div>
+      <div class="row">
+        <div class="pill" id="spot">Spot: —</div>
+        <div class="pill" id="pcr">PCR: —</div>
+        <div class="pill" id="vix">VIX: —</div>
+        <div class="pill" id="rsi">RSI(14): —</div>
+        <div class="pill" id="sr">S/R: —</div>
+        <div class="pill" id="mp">Max Pain: —</div>
+      </div>
+      <div class="big signal" id="signalText">Signal: —</div>
+      <div class="row" id="reasons"></div>
+      <canvas id="chart"></canvas>
+    </div>
+
+    <div class="card">
+      <div class="title">Quick Links</div>
+      <div class="row">
+        <a class="pill" href="/signal">/signal</a>
+        <a class="pill" href="/levels">/levels</a>
+        <a class="pill" href="/pcr">/pcr</a>
+        <a class="pill" href="/vix">/vix</a>
+        <a class="pill" href="/health">/health</a>
+      </div>
+      <p style="margin-top:10px; opacity:.8">Auto-refreshes every 60s. If any feed hiccups, values fall back to last known — the page will never crash.</p>
+    </div>
+  </div>
+  <footer>Built for intraday use. Stay disciplined: size small, respect stops.</footer>
+</div>
+
+<script>
+let lineChart = null;
+
+function cls(name){ return name.toLowerCase()==="bullish"?"good":(name.toLowerCase()==="bearish"?"bad":"neutral"); }
+
+async function fetchJSON(path){
+  try{
+    const r = await fetch(path, {cache:"no-cache"});
+    return await r.json();
+  }catch(e){ return {}; }
+}
+
+async function refresh(){
+  const sig = await fetchJSON('/signal');
+  const lev = await fetchJSON('/levels');
+  const chart = await fetchJSON('/chart');
+
+  // Pills
+  document.getElementById('spot').textContent = 'Spot: ' + (sig.spot ?? '—');
+  document.getElementById('pcr').textContent = 'PCR: ' + (sig.pcr ?? '—');
+  document.getElementById('vix').textContent = 'VIX: ' + (sig.vix ?? '—');
+  document.getElementById('rsi').textContent = 'RSI(14): ' + (sig.rsi14 ?? '—');
+  document.getElementById('sr').textContent = 'S/R: ' + ((sig.support ?? lev.support ?? '—') + ' / ' + (sig.resistance ?? lev.resistance ?? '—'));
+  document.getElementById('mp').textContent = 'Max Pain: ' + (sig.max_pain ?? '—');
+
+  // Signal
+  const signalText = document.getElementById('signalText');
+  signalText.textContent = 'Signal: ' + (sig.signal ?? '—') + '  (' + (sig.confidence ?? 0) + '%)';
+  signalText.className = 'big signal ' + cls(sig.signal || 'neutral');
+
+  // Reasons
+  const reasonsDiv = document.getElementById('reasons');
+  reasonsDiv.innerHTML = '';
+  (sig.reasons || []).slice(0, 5).forEach(r=>{
+    const div = document.createElement('div');
+    div.className = 'pill';
+    div.textContent = r;
+    reasonsDiv.appendChild(div);
+  });
+
+  // Chart
+  const closes = (chart.closes || []);
+  const labels = closes.map((_,i)=>i+1);
+  const ctx = document.getElementById('chart').getContext('2d');
+  if(lineChart) { lineChart.destroy(); }
+  lineChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{ data: closes, fill:false, tension:0.2 }] },
+    options: {
+      responsive:true,
+      plugins:{ legend:{ display:false } },
+      scales:{ x:{ display:false }, y:{ display:true } }
+    }
+  });
+}
+
+refresh();
+setInterval(refresh, 60000);
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def root():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
 
 # ----------------------------
 # Entrypoint
 # ----------------------------
 if __name__ == "__main__":
-    # initial warmup to avoid first-hit failures
     warmup()
     app.run(host="0.0.0.0", port=5000)
