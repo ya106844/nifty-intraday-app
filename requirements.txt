@@ -1,1 +1,4 @@
-flask
+Flask
+nsetools
+numpy
+requests
